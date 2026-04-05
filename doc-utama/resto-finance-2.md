@@ -184,7 +184,13 @@ CREATE TABLE menu_recipes (
     -- Untuk bahan tanpa penyusutan (tepung, gula): yield = 1.0
     yield_factor    NUMERIC(5,4) NOT NULL DEFAULT 1.0,
     notes           TEXT,
-    UNIQUE (menu_id, ingredient_id)
+    -- Soft delete: FALSE jika resep baris ini digantikan versi baru
+    -- JANGAN hard-delete — histori HPP perlu dipertahankan untuk audit
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE
+    -- Partial UNIQUE dibuat via CREATE UNIQUE INDEX (lihat Index section):
+    --   CREATE UNIQUE INDEX ON menu_recipes (menu_id, ingredient_id) WHERE is_active = TRUE
+    --   Memastikan: per menu hanya ada 1 baris AKTIF per ingredient
+    --   Baris lama (is_active=FALSE) boleh ada lebih dari satu
 );
 
 -- View: HPP teoritis per menu — hanya bahan Kategori A
@@ -195,19 +201,24 @@ SELECT
     m.name        AS menu_name,
     m.category,
     m.selling_price,
-    SUM(
-        mr.qty_per_portion
-        / mr.yield_factor
-        * i.avg_cost_per_unit
-    )             AS theoretical_cogs,
+    -- ROUND ke 0 desimal: nilai uang rupiah tidak perlu sen
+    -- SUM dulu (akumulasi float), baru ROUND sekali di akhir
+    ROUND(
+        SUM(
+            mr.qty_per_portion
+            / mr.yield_factor
+            * i.avg_cost_per_unit
+        )
+    , 0)          AS theoretical_cogs,
     ROUND(
         SUM(mr.qty_per_portion / mr.yield_factor * i.avg_cost_per_unit)
         / NULLIF(m.selling_price, 0) * 100
     , 1)          AS food_cost_pct_recipe_only    -- % ini BELUM termasuk overhead
 FROM menus m
-JOIN menu_recipes mr ON mr.menu_id = m.id
+JOIN menu_recipes mr ON mr.menu_id = m.id AND mr.is_active = TRUE
 JOIN ingredients i   ON i.id = mr.ingredient_id
 WHERE m.is_active = TRUE
+  AND i.is_active = TRUE
   AND i.ingredient_category = 'recipe'    -- pastikan hanya Kat. A
 GROUP BY m.id, m.name, m.category, m.selling_price;
 ```
@@ -256,10 +267,15 @@ CREATE TABLE stock_movements (
     ingredient_id   UUID NOT NULL REFERENCES ingredients(id),
     movement_type   movement_type NOT NULL,
     -- Positif = masuk, Negatif = keluar
+    -- qty dalam base unit (gram/ml/pcs) — presisi 3dp cukup untuk satuan terkecil
     qty             NUMERIC(12,3) NOT NULL,
-    -- Harga per unit SAAT transaksi ini terjadi (bukan avg_cost terkini)
+    -- cost_per_unit: Rp per base unit — presisi 4dp untuk harga sub-rupiah (Rp 38 / gram)
     cost_per_unit   NUMERIC(12,4) NOT NULL DEFAULT 0,
-    total_cost      NUMERIC(14,2) GENERATED ALWAYS AS (qty * cost_per_unit) STORED,
+    -- Pembulatan eksplisit: ROUND(qty*cost) agar tidak 3dp×4dp = 7dp karena float
+    -- Nilai rupiah selalu 2dp (sen) — dalam praktik restoran Indonesia cukup 0dp,
+    -- tapi 2dp aman untuk WAC yang menghasilkan pecahan kecil
+    total_cost      NUMERIC(14,2) GENERATED ALWAYS AS
+                        (ROUND(qty * cost_per_unit, 2)) STORED,
     -- Reference ke sumber transaksi
     reference_type  VARCHAR(30),   -- 'order', 'purchase', 'opname', 'waste_log'
     reference_id    UUID,
@@ -316,12 +332,43 @@ CREATE TABLE purchases (
 );
 
 CREATE TABLE purchase_items (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    purchase_id     UUID NOT NULL REFERENCES purchases(id),
-    ingredient_id   UUID NOT NULL REFERENCES ingredients(id),
-    qty             NUMERIC(12,3) NOT NULL,
-    unit_price      NUMERIC(12,4) NOT NULL,
-    subtotal        NUMERIC(14,2) GENERATED ALWAYS AS (qty * unit_price) STORED
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    purchase_id         UUID NOT NULL REFERENCES purchases(id),
+    ingredient_id       UUID NOT NULL REFERENCES ingredients(id),
+
+    -- ── SATUAN BELI (sesuai nota supplier) ─────────────────────
+    -- Supplier jual per kg/liter/ikat — resep pakai gram/ml/pcs
+    -- Dua satuan ini BERBEDA dan harus dikonversi sebelum masuk stok
+    purchase_qty        NUMERIC(12,3) NOT NULL,
+    purchase_unit       VARCHAR(20) NOT NULL,        -- 'kg','liter','ikat','dus','pcs', dll
+    -- 1 purchase_unit = conversion_factor base_unit
+    -- Contoh: kg → gram: 1000 | liter → ml: 1000 | lusin → pcs: 12 | ikat → gram: 250
+    conversion_factor   NUMERIC(10,4) NOT NULL DEFAULT 1
+                            CHECK (conversion_factor > 0),
+
+    -- ── HARGA (per satuan BELI, sesuai nota) ───────────────────
+    unit_price          NUMERIC(12,4) NOT NULL,
+
+    -- ── KOLOM DERIVED — dihitung otomatis ──────────────────────
+    -- Dipakai oleh confirm_purchase() — JANGAN edit manual
+    qty_in_base_unit    NUMERIC(14,4)
+                            GENERATED ALWAYS AS (purchase_qty * conversion_factor) STORED,
+    price_per_base_unit NUMERIC(14,6)
+                            GENERATED ALWAYS AS (unit_price / conversion_factor) STORED,
+    -- Total rupiah transaksi (qty beli × harga beli, sebelum konversi)
+    subtotal            NUMERIC(14,2)
+                            GENERATED ALWAYS AS (purchase_qty * unit_price) STORED
+);
+
+-- Tabel referensi konversi satuan
+-- Dipakai oleh frontend untuk auto-fill conversion_factor saat input pembelian
+-- Contoh: staff pilih bahan 'Ayam' (base: gram) + satuan beli 'kg' → factor otomatis 1000
+CREATE TABLE unit_conversions (
+    base_unit     VARCHAR(20) NOT NULL,   -- sesuai ingredients.unit: gram, ml, pcs, portion
+    purchase_unit VARCHAR(20) NOT NULL,   -- satuan yang dipakai supplier
+    factor        NUMERIC(10,4) NOT NULL, -- purchase_qty × factor = qty_in_base_unit
+    description   TEXT,
+    PRIMARY KEY (base_unit, purchase_unit)
 );
 ```
 
@@ -354,20 +401,23 @@ BEGIN
         v_old_stock := v_item.current_stock;
         v_old_cost  := v_item.avg_cost_per_unit;
 
-        -- Weighted Average Cost — berlaku untuk semua kategori
-        -- (Kat. B tetap perlu referensi harga terkini untuk estimasi overhead)
+        -- Weighted Average Cost — SELALU dalam satuan DASAR (base unit: gram/ml/pcs)
+        -- Kat. B tetap perlu referensi harga terkini untuk estimasi overhead
+        -- qty_in_base_unit dan price_per_base_unit sudah dihitung otomatis oleh DB
         v_new_avg_cost := (
-            (v_old_stock * v_old_cost) + (v_item.qty * v_item.unit_price)
-        ) / NULLIF(v_old_stock + v_item.qty, 0);
+            (v_old_stock * v_old_cost)
+            + (v_item.qty_in_base_unit * v_item.price_per_base_unit)
+        ) / NULLIF(v_old_stock + v_item.qty_in_base_unit, 0);
 
         IF v_item.ingredient_category = 'recipe' THEN
-            -- Kategori A: update stok + harga
+            -- Kategori A: update stok + harga — dalam satuan DASAR
             UPDATE ingredients
-            SET current_stock     = current_stock + v_item.qty,
+            SET current_stock     = current_stock + v_item.qty_in_base_unit,
                 avg_cost_per_unit = v_new_avg_cost
             WHERE id = v_item.ingredient_id;
 
-            -- Audit trail hanya untuk Kat. A
+            -- Audit trail — qty dan cost_per_unit SELALU dalam satuan dasar
+            -- (sehingga stock_movements bisa dibandingkan langsung dengan recipe qty)
             INSERT INTO stock_movements (
                 restaurant_id, ingredient_id, movement_type,
                 qty, cost_per_unit,
@@ -376,7 +426,8 @@ BEGIN
             ) VALUES (
                 (SELECT restaurant_id FROM purchases WHERE id = p_purchase_id),
                 v_item.ingredient_id, 'purchase',
-                v_item.qty, v_item.unit_price,
+                v_item.qty_in_base_unit,       -- gram/ml/pcs (bukan kg/liter)
+                v_item.price_per_base_unit,    -- Rp per gram/ml/pcs
                 'purchase', p_purchase_id,
                 p_confirmed_by
             );
@@ -517,13 +568,16 @@ BEGIN
                     p_user_id
                 );
 
+                -- Akumulasi per bahan: ROUND per baris
+                -- (hindari error propagation jika ada banyak bahan dengan harga pecahan)
                 v_item_cogs := v_item_cogs
-                    + (v_total_qty * v_recipe.avg_cost_per_unit);
+                    + ROUND(v_total_qty * v_recipe.avg_cost_per_unit, 0);
             END;
         END LOOP;
 
         -- Update theoretical_cogs di order_item
         -- Nilai ini = HPP Kat. A saja, belum termasuk overhead
+        -- Sudah dibulatkan ke rupiah bulat (0 desimal) — cukup untuk konteks restoran
         UPDATE order_items
         SET theoretical_cogs = v_item_cogs
         WHERE id = v_item.id;
